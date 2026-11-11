@@ -1,0 +1,7 @@
+# Optional local voice input. No torch/CUDA or cloud API needed.
+sounddevice==0.5.6
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+huggingface-hub==1.33.0
+# PyAV19 removed metadata_errors, still used by faster-whisper1.2.1.
+av==18.1.0

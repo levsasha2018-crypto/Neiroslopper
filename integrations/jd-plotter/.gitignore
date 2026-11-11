@@ -1,0 +1,10 @@
+**/.venv/
+**/.pio/
+**/__pycache__/
+**/data/
+**/connection.json
+**/connection.tmp
+**/app-health.json
+**/*.log
+!/dwin-assistant-20261108/DWIN_SET/*.BIN
+!/plotter-v22-dwin9600-20261106/firmware/pending-panel5-20261110/firmware-panel5.bin

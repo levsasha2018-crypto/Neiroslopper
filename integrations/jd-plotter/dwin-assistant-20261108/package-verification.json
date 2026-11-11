@@ -1,0 +1,51 @@
+{
+  "valid": true,
+  "hardware_tested": false,
+  "touch_controls": 146,
+  "display_controls": 198,
+  "locally_reachable_menus": [
+    3,
+    5,
+    6,
+    8
+  ],
+  "startup_status_vp": 4866,
+  "bytes": 1134228,
+  "allocations": [
+    {
+      "name": "13_Touch.BIN",
+      "bytes": 32768,
+      "first_slot": 13,
+      "last_slot": 13,
+      "offset": 3407872
+    },
+    {
+      "name": "14_Display.BIN",
+      "bytes": 22752,
+      "first_slot": 14,
+      "last_slot": 14,
+      "offset": 3670016
+    },
+    {
+      "name": "22_VP_Init.BIN",
+      "bytes": 131072,
+      "first_slot": 22,
+      "last_slot": 22,
+      "offset": 5767168
+    },
+    {
+      "name": "32_Backgrounds.ICL",
+      "bytes": 484368,
+      "first_slot": 32,
+      "last_slot": 33,
+      "offset": 8388608
+    },
+    {
+      "name": "60_Status.ICL",
+      "bytes": 463268,
+      "first_slot": 60,
+      "last_slot": 61,
+      "offset": 15728640
+    }
+  ]
+}
