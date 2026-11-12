@@ -1,11 +1,14 @@
 import copy
 import sys
+import threading
 import unittest
+from unittest.mock import Mock, call, patch
 from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "PROGRAM"))
+from controller import GrblSession
 from machine_profiles import DLC32, fluidnc_configuration, fluidnc_pen_profile, pen_matches, settings_ready
 from pen_lift import PenLiftSettings
 
@@ -51,6 +54,26 @@ class V22Tests(unittest.TestCase):
         partial["macros"].pop("after_reset")
         with self.assertRaisesRegex(ValueError, "автоматические макросы"):
             fluidnc_configuration(yaml.safe_dump(partial).splitlines())
+
+    def test_speed_limits_are_read_back_without_motion_or_flash_write(self):
+        callback = Mock()
+        session = GrblSession(Mock(), threading.Event(), callback, DLC32)
+        session.settings = fluidnc_configuration(self.real_dump.splitlines())
+
+        def updated():
+            session.settings.update({110: 1500, 111: 1500, 120: 40, 121: 40})
+
+        with patch.object(session, "ready") as ready, patch.object(session, "command") as command, \
+             patch.object(session, "refresh_settings", side_effect=updated):
+            session.set_motion_limits(1500, 40)
+        ready.assert_called_once()
+        self.assertEqual(command.call_args_list, [
+            call("$/axes/x/max_rate_mm_per_min=1500.000"),
+            call("$/axes/y/max_rate_mm_per_min=1500.000"),
+            call("$/axes/x/acceleration_mm_per_sec2=40.000"),
+            call("$/axes/y/acceleration_mm_per_sec2=40.000"),
+        ])
+        self.assertEqual(min(session.settings[110], session.settings[111]), 1500)
 
     def test_case_conflicting_axis_names_are_rejected(self):
         config = copy.deepcopy(self.config)

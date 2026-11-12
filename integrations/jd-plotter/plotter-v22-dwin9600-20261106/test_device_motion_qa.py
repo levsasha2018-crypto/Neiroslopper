@@ -128,6 +128,60 @@ class MotionLifecycleTests(unittest.TestCase):
         self.assertTrue(any(kind == 'error' for kind, _ in events))
         self.assertEqual(self.machine.session.wire.ink_moves, [])
 
+    def test_long_drawing_pipelines_moves_and_preserves_pen_boundaries(self):
+        wire = self.prepare()
+        checkpoint = len(wire.ink_moves)
+        largest_burst = 0
+        write = wire.write
+
+        def measure(data):
+            nonlocal largest_burst
+            count = write(data)
+            if data.startswith(b'G1 '):
+                largest_burst = max(largest_burst, wire.rx.count(b'ok\r\n'))
+                if len(wire.ink_moves) - checkpoint == 100:
+                    self.assertTrue(self.machine.change_drawing_feed(1800))
+            return count
+
+        wire.write = measure
+        stroke = [(2 + (i % 70) / 10, 2 + i / 1000) for i in range(12000)]
+        events = self.job('draw', paths=[stroke], feed=900, travel_feed=1200)
+        self.assertIn(('finished', 'draw'), events)
+        self.assertGreater(largest_burst, 1)
+        self.assertEqual(len(wire.ink_moves) - checkpoint, len(stroke))
+        self.assertIn('F1200', wire.ink_moves[checkpoint][0])
+        self.assertFalse(wire.ink_moves[checkpoint][1])
+        self.assertIn('F900', wire.ink_moves[checkpoint + 1][0])
+        self.assertTrue(any('F1800' in command for command, _ in wire.ink_moves[checkpoint + 100:]))
+        self.assertFalse(self.machine.change_drawing_feed(1500))
+        self.assertTrue(all(down for _, down in wire.ink_moves[checkpoint + 1:]))
+        self.assertEqual(wire.position, stroke[-1])
+        self.assertFalse(wire.coil_on)
+
+    def test_alarm_during_a_buffered_stroke_requires_recalibration(self):
+        self.pen = PenLiftSettings()
+        wire = self.prepare()
+        write = wire.write
+        sent = 0
+
+        def alarm(data):
+            nonlocal sent
+            if data.startswith(b'G1 '):
+                sent += 1
+                if sent == 5:
+                    wire.respond('ALARM:3')
+                    return len(data)
+            return write(data)
+
+        wire.write = alarm
+        paths = [[(i / 10, 2) for i in range(100)]]
+        events = self.job('draw', paths=paths, feed=900)
+        self.assertNotIn(('finished', 'draw'), events)
+        self.assertTrue(any(kind == 'error' and 'ALARM:3' in detail for kind, detail in events))
+        self.assertLess(sent, 15)
+        self.assertIn(b'\x18', wire.history)
+        self.assertFalse(self.machine.zero)
+
     def test_short_write_during_drawing_is_not_replayed(self):
         wire = self.prepare()
         write = wire.write

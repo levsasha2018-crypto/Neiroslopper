@@ -1,4 +1,5 @@
 """Desktop end-to-end tests using DEMO or fake links, with no hardware access."""
+import gc
 import json
 from pathlib import Path
 import sys
@@ -29,10 +30,15 @@ class DeviceUITests(unittest.TestCase):
         self.root = tk.Tk()
         self.root.withdraw()
         self.app = App(self.root)
-        self.addCleanup(self.app.controller.worker.join, 1)
-        self.addCleanup(self.app.close)
+        self.addCleanup(self.close_app)
         self.errors = self.enterContext(patch('app.messagebox.showerror'))
         self.enterContext(patch('app.messagebox.askokcancel', return_value=True))
+
+    def close_app(self):
+        self.app.close()
+        self.app.controller.worker.join(1)
+        self.app = self.root = None
+        gc.collect()
 
     def wait_for(self, predicate):
         deadline = time.monotonic() + 4
@@ -88,6 +94,41 @@ class DeviceUITests(unittest.TestCase):
         self.assertEqual(float(self.app.progress['value']), 100)
         self.assertFalse(self.errors.called)
 
+    def test_large_actual_svg_is_fitted_and_refitted_to_a_new_sheet(self):
+        self.prepare()
+        with tempfile.TemporaryDirectory() as folder:
+            svg = Path(folder) / 'large.svg'
+            svg.write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="80mm" '
+                'viewBox="0 0 100 80" data-plotter-size="actual"><path d="M0,0 L100,80"/></svg>',
+                encoding='utf-8',
+            )
+            self.app.load_file(svg)
+            self.idle()
+            for actual, expected in zip(self.app.paths[0], [(3.0, 4.4), (17.0, 15.6)]):
+                for a, b in zip(actual, expected):
+                    self.assertAlmostEqual(a, b)
+            self.app.sheet = Sheet(4, 4)
+            self.app.refit_svg()
+            self.idle()
+            for point in self.app.paths[0]:
+                self.assertTrue(self.app.sheet.contains(point))
+            self.assertAlmostEqual(self.app.paths[0][0][0], 1)
+            self.assertAlmostEqual(self.app.paths[0][-1][0], 3)
+        self.errors.assert_not_called()
+
+    def test_drawing_and_travel_have_separate_speed_fields(self):
+        self.prepare()
+        self.app.load_test()
+        self.app.feed.set('100')
+        self.app.draw_feed.set('40')
+        with patch.object(self.app, 'submit', return_value=True) as submit:
+            self.assertTrue(self.app.draw())
+            self.assertEqual(submit.call_args.kwargs['feed'], 1200)
+            self.assertEqual(submit.call_args.kwargs['travel_feed'], 3000)
+            self.assertTrue(self.app.go_start())
+            self.assertEqual(submit.call_args.kwargs['feed'], 3000)
+
     def test_stop_blocks_job_until_calibrated_again(self):
         self.prepare()
         self.app.load_test()
@@ -127,7 +168,7 @@ class DeviceUITests(unittest.TestCase):
         original = self.app.paths
         started, release = threading.Event(), threading.Event()
 
-        def read(*_args):
+        def read(*_args, **_kwargs):
             started.set()
             release.wait(2)
             return [[(2, 2), (9, 9)]]

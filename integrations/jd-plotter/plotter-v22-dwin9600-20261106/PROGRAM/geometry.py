@@ -89,14 +89,14 @@ class ImportedPaths(list):
         self.actual_size = actual_size
 
 
-def load_svg(filename, sheet, margin=3.0):
+def load_svg(filename, sheet, margin=3.0, *, fit_oversize=False):
     """Outline-only SVG import. Reject unsupported rendering instead of guessing."""
     with FilePath(filename).open('rb') as stream:
         raw = stream.read(3_000_001)
-    return load_svg_bytes(raw, sheet, margin)
+    return load_svg_bytes(raw, sheet, margin, fit_oversize=fit_oversize)
 
 
-def load_svg_bytes(raw, sheet, margin=3.0, *, paper_coordinates=False):
+def load_svg_bytes(raw, sheet, margin=3.0, *, paper_coordinates=False, fit_oversize=False):
     """Render authored vector strokes. In paper space one unit equals one millimetre."""
     from svgelements import SVG, Shape, Path, Move, Line, Close
     if not math.isfinite(margin) or margin < 0 or 2 * margin >= min(sheet.width, sheet.height):
@@ -148,17 +148,24 @@ def load_svg_bytes(raw, sheet, margin=3.0, *, paper_coordinates=False):
             raise ValueError("Рисунок выходит за заданный прямоугольник.")
         scale = 1.0
         ox, oy = left, top
-    elif actual_size:
-        # SVG geometry is resolved into CSS pixels; convert those to mm.
-        # Calibration samples must never grow or shrink to fill the paper.
-        scale = 25.4 / 96
-        if width * scale > sheet.width - 2 * margin + 0.001 or height * scale > sheet.height - 2 * margin + 0.001:
-            raise ValueError("Рисунок 1:1 не помещается на лист с заданным полем. Выберите больший лист или уменьшите поле.")
-        ox = oy = margin
     else:
-        scale = min((sheet.width - 2 * margin) / width if width else math.inf,
-                    (sheet.height - 2 * margin) / height if height else math.inf)
-        ox, oy = (sheet.width - width * scale) / 2, (sheet.height - height * scale) / 2
+        available_width = sheet.width - 2 * margin
+        available_height = sheet.height - 2 * margin
+        fit_scale = min(available_width / width if width else math.inf,
+                        available_height / height if height else math.inf)
+        # The calibrated samples still use physical dimensions by default.
+        # Ordinary file import can shrink an oversized 1:1 export uniformly.
+        mm_per_px = 25.4 / 96
+        if actual_size and fit_scale + 1e-12 < mm_per_px:
+            if not fit_oversize:
+                raise ValueError("Рисунок 1:1 не помещается на лист с заданным полем. Выберите больший лист или уменьшите поле.")
+            actual_size = False
+        if actual_size:
+            scale = mm_per_px
+            ox = oy = margin
+        else:
+            scale = fit_scale
+            ox, oy = (sheet.width - width * scale) / 2, (sheet.height - height * scale) / 2
     curve_tolerance = 0.02 if actual_size else 0.10
     max_curve_segment = 0.5 if actual_size else 3
 

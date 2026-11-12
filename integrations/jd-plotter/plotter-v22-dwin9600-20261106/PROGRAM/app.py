@@ -56,6 +56,7 @@ class App:
         self.svg_loading = False
         self.svg_token = None
         self.svg_worker = None
+        self.imported_svg = None
         self.preview_key = None
         self.preview_paths = None
         self.preview_transform = None
@@ -68,6 +69,10 @@ class App:
         self.machine_profile = tk.StringVar(value=PROFILE_LABELS[load_selected_profile(data_dir)])
         self.step = tk.StringVar(value="1")
         self.feed = tk.StringVar(value="50")
+        self.draw_feed = tk.StringVar(value="50")
+        self.motion_rate = tk.StringVar(value="1500")
+        self.motion_acceleration = tk.StringVar(value="40")
+        self.motion_maximum = tk.StringVar(value="Предел платы появится после подключения.")
         self.margin = tk.StringVar(value="3")
         self.hold = tk.BooleanVar(value=True)
         pen = self.stored_pen_settings()
@@ -229,6 +234,23 @@ class App:
         self.hold_button = ttk.Checkbutton(setup, text="Удерживать моторы в простое", variable=self.hold,
                                           command=self.change_hold)
         self.hold_button.pack(anchor="w", pady=(5, 2))
+        limits = ttk.LabelFrame(setup, text="Скорость MKS", padding=6)
+        limits.pack(fill="x", pady=(4, 4))
+        self.motion_limits_fields = []
+        for label, variable in (("Предел X/Y, мм/мин", self.motion_rate),
+                                ("Ускорение X/Y, мм/с²", self.motion_acceleration)):
+            row = ttk.Frame(limits)
+            row.pack(fill="x", pady=2)
+            ttk.Label(row, text=label).pack(side="left")
+            entry = ttk.Entry(row, textvariable=variable, width=9)
+            entry.pack(side="right")
+            self.motion_limits_fields.append(entry)
+        self.motion_limits_button = ttk.Button(limits, text="Применить до перезапуска MKS",
+                                               command=self.apply_motion_limits)
+        self.motion_limits_button.pack(fill="x", pady=3)
+        self.motion_limits_fields.append(self.motion_limits_button)
+        ttk.Label(limits, textvariable=self.motion_maximum, wraplength=305).pack(anchor="w")
+        self.motion_limits_box = limits
         self.axis_widgets = []
         for text, variable in (("Каретка ←/→, портал ↑/↓ (X ↔ Y)", self.swap),
                                ("Развернуть направление вправо", self.reverse_right),
@@ -339,6 +361,12 @@ class App:
         self.startpoint_button.pack(side="left", padx=(0, 8))
         self.draw_button = ttk.Button(actions, text="Начать рисование", command=self.draw)
         self.draw_button.pack(side="left")
+        ttk.Label(actions, text="Скорость рисования, %").pack(side="left", padx=(12, 4))
+        self.draw_feed_input = ttk.Entry(actions, textvariable=self.draw_feed, width=6)
+        self.draw_feed_input.pack(side="left")
+        self.draw_feed_input.bind("<Return>", self.apply_drawing_feed)
+        self.draw_feed_apply = ttk.Button(actions, text="Применить", command=self.apply_drawing_feed)
+        self.draw_feed_apply.pack(side="left", padx=(4, 0))
         self.progress = ttk.Progressbar(right, maximum=100)
         self.progress.pack(fill="x", pady=8)
         ttk.Label(right, textvariable=self.hint, wraplength=700, foreground="#225ea8").pack(anchor="w")
@@ -448,6 +476,8 @@ class App:
         else:
             self.offered_panel_request = None
             self.panel_request_button.pack_forget()
+        if changed and self.sheet:
+            self.refit_svg()
         if changed or self.position != previous_position:
             self.request_redraw()
 
@@ -518,7 +548,7 @@ class App:
         from editor_tools.preview import snapshot
         sheet = self.drawing_sheet()
         try:
-            preview_feed = self.get_feed()
+            preview_feed = self.get_feed(drawing=True)
         except ValueError:
             preview_feed = None
         return snapshot({"sandbox": False, "connected": self.connected,
@@ -645,7 +675,7 @@ class App:
                 params["panel_context"] = self.panel_calibration[:2] if self.panel_calibration else None
         params.setdefault("axes", self.axes())
         try:
-            if action not in ("disconnect","configure","hold","clear","unlock"):
+            if action not in ("disconnect","configure","hold","clear","unlock","motion_limits"):
                 params.setdefault("pen", self.read_pen_settings().as_dict())
         except ValueError as exc:
             messagebox.showerror("Настройки ручки",str(exc),parent=self.root)
@@ -926,8 +956,28 @@ class App:
         self.preserve_draft()
         self.submit("unlock", confirmed=True)
 
-    def get_feed(self):
-        percent = float(self.feed.get().replace(",", "."))
+    def apply_motion_limits(self):
+        try:
+            rate = float(self.motion_rate.get().replace(",", "."))
+            acceleration = float(self.motion_acceleration.get().replace(",", "."))
+        except ValueError:
+            self.note("Для пределов MKS укажите числа в мм/мин и мм/с².")
+            return
+        self.submit("motion_limits", rate=rate, acceleration=acceleration)
+
+    def apply_drawing_feed(self, event=None):
+        if self.controller.drawing:
+            try:
+                feed = self.get_feed(drawing=True)
+            except ValueError:
+                self.note("Скорость рисования: введите число от 1 до 100%.")
+            else:
+                if self.controller.change_drawing_feed(feed):
+                    self.note(f"Новая скорость рисования {feed:g} мм/мин применяется к следующим участкам.")
+
+    def get_feed(self, *, drawing=False):
+        field = self.draw_feed if drawing else self.feed
+        percent = float(field.get().replace(",", "."))
         if not math.isfinite(percent) or not 1 <= percent <= 100:
             raise ValueError("Введите скорость от 1 до 100%.")
         configured_max = min(float(self.settings.get(110, MACHINE_MAX_FEED)),
@@ -985,6 +1035,17 @@ class App:
         self.svg_token = None
         self.svg_loading = False
 
+    def refit_svg(self):
+        if self.imported_svg is None or self.sheet is None or self.svg_loading:
+            return
+        filename, previous_sheet = self.imported_svg
+        if self.sheet == previous_sheet:
+            return
+        if self.svg_worker is not None and self.svg_worker.is_alive():
+            self.root.after(100, self.refit_svg)
+        else:
+            self.load_file(filename)
+
     def load_file(self, filename):
         if self.controller.busy or self.svg_loading or self.drawing_sheet() is None:
             return
@@ -997,6 +1058,9 @@ class App:
             messagebox.showerror("SVG не загружен", str(exc), parent=self.root)
             return
         sheet = self.drawing_sheet()
+        shortest = min(sheet.width, sheet.height)
+        if math.isfinite(margin) and margin >= shortest / 2:
+            margin = shortest / 4
         token = self.svg_token = object()
         self.svg_loading = True
         self.hint.set("Загружаю рисунок…")
@@ -1005,7 +1069,7 @@ class App:
 
         def read_svg():
             try:
-                result = load_svg(filename, sheet, margin)
+                result = load_svg(filename, sheet, margin, fit_oversize=True)
             except Exception as exc:
                 result = exc
             # Only the Tk thread handles widgets; obsolete imports are ignored.
@@ -1020,6 +1084,7 @@ class App:
             self.note("Не удалось запустить чтение SVG. Повторите открытие файла.")
 
     def loaded(self, preserve_history=False):
+        self.imported_svg = None
         if not preserve_history:
             self.editor_history.clear()
             self.editor_undo = None
@@ -1065,7 +1130,10 @@ class App:
                 raise ValueError("Эскиз сохранён. Подключитесь и заново задайте оба угла перед движением.")
             from geometry import validate_paths
             validate_paths(self.paths, self.sheet)
-            accepted = self.submit(action, paths=[list(path) for path in self.paths], feed=self.get_feed(),
+            travel = self.get_feed()
+            feed = self.get_feed(drawing=True) if action == "draw" else travel
+            accepted = self.submit(action, paths=[list(path) for path in self.paths],
+                                   feed=feed, travel_feed=travel,
                                    panel_request=panel_request, panel_context=panel_context)
             if accepted:
                 self.progress["value"] = 0
@@ -1124,6 +1192,19 @@ class App:
         elif not busy and self.pen_ready() and self.pen_status.get().startswith(('Профиль','В настройках','Подключите','Режим без подъёма','DEMO:')):
             self.pen_status.set("Подъём включается только на время переходов и теста. После остановки ручка внизу." if power_raises else
                                 "Автоподъём готов. Тест кратковременный, оси не движутся.")
+        live_speed = (self.controller.drawing and not self.controller.cancelled.is_set() and
+                      (not self.pen_enabled.get() or self.pen_continuous.get()))
+        self.draw_feed_apply.configure(state="normal" if live_speed else "disabled")
+        mks = self.effective_machine_profile() == DLC32
+        if mks and not self.motion_limits_box.winfo_manager():
+            self.motion_limits_box.pack(after=self.hold_button, fill="x", pady=(4, 4))
+        elif not mks and self.motion_limits_box.winfo_manager():
+            self.motion_limits_box.pack_forget()
+        for widget in self.motion_limits_fields:
+            widget.configure(state="normal" if ready and mks else "disabled")
+        rates = [self.settings.get(key) for key in (110, 111)]
+        self.motion_maximum.set(f"100% сейчас = {min(rates):g} мм/мин" if all(rates) else
+                                "Предел платы появится после подключения.")
         self.connect_button.configure(text="Отключить" if self.connected else "Подключить")
         for widget, enabled in (
                 (self.connect_button, not busy), (self.refresh_button, not busy and not self.connected),
@@ -1134,7 +1215,7 @@ class App:
                 (self.clear_button, available and self.zero), (self.load_button, not busy and self.drawing_sheet() is not None),
                 (self.test_button, not busy and self.drawing_sheet() is not None),
                 (self.startpoint_button, drawing_ready and bool(self.paths)), (self.draw_button, drawing_ready and bool(self.paths)),
-                (self.feed_input, not busy), (self.margin_input, not busy)):
+                (self.feed_input, not busy), (self.draw_feed_input, not busy or live_speed), (self.margin_input, not busy)):
             widget.configure(state="normal" if enabled else "disabled")
         for widget in self.jog_buttons:
             widget.configure(state="normal" if motion_ready else "disabled")
@@ -1338,6 +1419,7 @@ class App:
                 if self.sheet:
                     self.draft_sheet = self.sheet
                     self.paper_text.set(f"Лист: {self.sheet.width:.2f} × {self.sheet.height:.2f} мм")
+                    self.refit_svg()
                     if self.paths:
                         from geometry import validate_paths
                         try:
@@ -1399,8 +1481,8 @@ class App:
             self.coordinates.set(f"Вправо: {u:.2f} · вниз: {v:.2f} мм · {state}")
         if latest_progress is not None:
             sent, total = latest_progress
-            self.progress["value"] = 100 * sent / max(1, total)
-            self.hint.set(f"По данным контроллера выполнено {sent:.1f}/{total:.1f} мм штрихов." if isinstance(total,float) else
+            self.progress["value"] = 100 * sent / total if total else 0
+            self.hint.set(f"В очередь контроллера принято {sent:.1f}/{total:.1f} мм." if isinstance(total,float) else
                           f"В контроллер передано {sent}/{total} участков. Ожидаю завершения движения…")
         while not self.svg_events.empty():
             token, filename, margin, result = self.svg_events.get_nowait()
@@ -1413,9 +1495,9 @@ class App:
             else:
                 self.paths = result
                 self.file_name = Path(filename).name + f" · {len(result)} контур(ов) · поле {margin:g} мм"
-                if getattr(result, "actual_size", False):
-                    self.file_name += " · размер 1:1, без растягивания"
+                self.file_name += " · размер 1:1" if result.actual_size else " · подогнан под лист"
                 self.loaded()
+                self.imported_svg = (filename, self.drawing_sheet())
                 redraw = False
         if redraw:
             self.redraw()

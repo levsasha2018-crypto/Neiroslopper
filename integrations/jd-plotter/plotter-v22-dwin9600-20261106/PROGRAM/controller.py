@@ -20,6 +20,16 @@ from machine_profiles import (UNO, DLC32, profile_id, settings_ready, fluidnc_id
 MACHINE_MAX_FEED = 3000.0
 MACHINE_ACCELERATION = 150.0
 MAX_JOG_DISTANCE = 100.0
+# Leave room in the 128-byte receive buffer used by legacy GRBL. FluidNC
+# accepts the same short ASCII lines over its USB and TCP channels.
+STREAM_RX_BYTES = 120
+ALARM_REASONS = {
+    1: "Сработал аппаратный предел хода.",
+    2: "Команда вышла за программный предел хода.",
+    3: "Движение прервано сбросом контроллера. Проверьте журнал связи MKS.",
+    11: "При включении был активен один из входов.",
+    16: "Сбросился расширитель выходов MKS.",
+}
 
 
 def dgus_marker(lines):
@@ -207,11 +217,15 @@ class GrblSession:
         elif line.startswith("[MSG:PEN_GUARD:"):
             raise RuntimeError("Сработало ограничение включения соленоида. Реле выключено прошивкой; "
                                "движение прервано. Проверьте нагрев, механику и USB; задайте оба угла заново.")
-        elif line.startswith(("error:", "ALARM:")):
+        elif line.startswith("ALARM:"):
+            code = re.match(r"ALARM:(\d+)", line)
+            reason = ALARM_REASONS.get(int(code[1]), "") if code else ""
+            raise RuntimeError(f"{line}. {reason} После устранения причины задайте оба угла заново.")
+        elif line.startswith("error:"):
             context = f" после команды {self.last_command!r}" if self.last_command else ""
             raise RuntimeError(f"GRBL: {line}{context}. Проверьте механику и настройки; ноль сброшен.")
         elif line.startswith("Grbl") and self.trusted:
-            raise RuntimeError("MKS сбросила движение. Нужно заново выставить оба угла."
+            raise RuntimeError("MKS сбросила движение (FluidNC прислала стартовое сообщение). Нужно заново выставить оба угла."
                                if self.native_panel else
                                "Контроллер перезапустился. Нужно заново выставить обе точки.")
         return line
@@ -268,6 +282,51 @@ class GrblSession:
             if query_started is not None and now - max(query_started, self.last_status) > 3:
                 raise TimeoutError("Контроллер перестал отвечать. Снимите питание моторов, если движение продолжается.")
         raise TimeoutError(f"Нет подтверждения команды {command!r}. Позиция больше не считается достоверной.")
+
+    def stream_moves(self, commands, on_ack=None, timeout=15):
+        """Queue only linear moves and account for each ACK before a pen change."""
+        commands = iter(commands)
+        next_move = next(commands, None)
+        pending = deque()
+        queued_bytes = 0
+        deadline = time.monotonic() + timeout
+        next_query = time.monotonic() + .25
+        progress_position = self.position
+        while next_move is not None or pending:
+            self.check_network_interlock()
+            while next_move is not None:
+                command, length = next_move
+                payload = (command + "\n").encode("ascii")
+                if len(payload) > STREAM_RX_BYTES:
+                    raise RuntimeError("Слишком длинная команда траектории.")
+                if queued_bytes + len(payload) > STREAM_RX_BYTES:
+                    break
+                if not pending:
+                    deadline = time.monotonic() + timeout
+                    self.last_command = command
+                self.write(payload)
+                pending.append((command, len(payload), length))
+                queued_bytes += len(payload)
+                next_move = next(commands, None)
+            line = self.read_line()
+            now = time.monotonic()
+            if line == "ok":
+                _, size, length = pending.popleft()
+                queued_bytes -= size
+                if pending:
+                    self.last_command = pending[0][0]
+                deadline = now + timeout
+                if on_ack is not None:
+                    on_ack(length)
+            elif (line and line.startswith("<") and self.state == "Run" and
+                  self.position is not None and self.position != progress_position):
+                progress_position = self.position
+                deadline = now + timeout
+            if now >= deadline:
+                raise TimeoutError(f"Нет подтверждения участка {self.last_command!r}. Рисование остановлено.")
+            if pending and now >= next_query:
+                self._query_status()
+                next_query = now + .25
 
     def status(self):
         deadline = time.monotonic() + 3
@@ -498,6 +557,29 @@ class GrblSession:
         self.refresh_settings()
         self.ready()
 
+    def set_motion_limits(self, rate, acceleration):
+        if self.machine_profile != DLC32:
+            raise ValueError("Эта настройка доступна для MKS с FluidNC.")
+        values = ((rate, 250000), (acceleration, 100000))
+        if any(type(value) not in (int, float) or not math.isfinite(value) or
+               not .001 <= value <= maximum for value, maximum in values):
+            raise ValueError("Укажите положительные пределы подачи и ускорения MKS.")
+        self.ready()
+        changes = (
+            (110, "x/max_rate_mm_per_min", rate),
+            (111, "y/max_rate_mm_per_min", rate),
+            (120, "x/acceleration_mm_per_sec2", acceleration),
+            (121, "y/acceleration_mm_per_sec2", acceleration),
+        )
+        for key, setting, value in changes:
+            if not math.isclose(self.settings[key], value, abs_tol=.0005):
+                self.check_network_interlock()
+                self.command(f"$/axes/{setting}={value:.3f}")
+        self.refresh_settings()
+        if any(not math.isclose(self.settings[key], value, abs_tol=.0005) for key, _, value in changes):
+            raise RuntimeError("MKS не подтвердила новые пределы. Проверьте настройки после переподключения.")
+        self.callback("log", f"MKS до перезапуска: предел X/Y {rate:g} мм/мин, ускорение {acceleration:g} мм/с².")
+
     def unlock_alarm(self):
         """Explicit MKS-only recovery; never moves, powers the relay, or homes.
 
@@ -657,6 +739,8 @@ class Controller:
     def __init__(self, start_worker=True, network_interlock=None):
         self.events = queue.Queue()
         self.jobs = queue.Queue()
+        self.drawing = False
+        self.draw_feed_override = None
         self.lock = threading.Lock()
         self.cancelled = threading.Event()
         self.busy = False
@@ -697,8 +781,20 @@ class Controller:
             if action == "connect":
                 self.cancelled.clear()
             self.busy = True
+            self.drawing = action == "draw"
+            self.draw_feed_override = None
         self.jobs.put((action, params))
         return True
+
+    def change_drawing_feed(self, rate):
+        with self.lock:
+            if not self.drawing or self.cancelled.is_set() or self.session is None:
+                return False
+            max_feed = min(self.session.settings.get(110, 0), self.session.settings.get(111, 0))
+            if not math.isfinite(rate) or not 0 < rate <= max_feed:
+                return False
+            self.draw_feed_override = rate
+            return True
 
     def stop(self):
         # Mark first, so no later ordinary write can overtake the reset.
@@ -788,6 +884,8 @@ class Controller:
             finally:
                 with self.lock:
                     self.busy = False
+                    self.drawing = False
+                    self.draw_feed_override = None
                 self.emit("done", action)
 
     def execute_job(self, action, params):
@@ -852,7 +950,7 @@ class Controller:
         if action == "disconnect":
             self.disconnect()
             return
-        profile = self.pen_settings if action in ("configure","hold","clear","unlock") else PenLiftSettings.from_value(params.get("pen", self.pen_settings))
+        profile = self.pen_settings if action in ("configure","hold","clear","unlock","motion_limits") else PenLiftSettings.from_value(params.get("pen", self.pen_settings))
         if action == "connect":
             self.disconnect(notify=self.session is not None or not params.get("expected_board"))
             if self.cancelled.is_set():
@@ -913,6 +1011,9 @@ class Controller:
             self.sheet = self.axes = None
             self.emit("calibration", (False, None))
             s.unlock_alarm()
+            return
+        if action == "motion_limits":
+            s.set_motion_limits(params["rate"], params["acceleration"])
             return
         if action == "configure":
             self.zero = False
@@ -1000,8 +1101,10 @@ class Controller:
             self.emit("calibration", (True, self.sheet))
             return
         feed = float(params.get("feed", MACHINE_MAX_FEED / 2))
+        travel_feed = float(params.get("travel_feed", feed))
         max_feed = min(float(s.settings.get(110, 0)), float(s.settings.get(111, 0)))
-        if not math.isfinite(feed) or feed <= 0 or max_feed <= 0 or feed > max_feed + 0.001:
+        if max_feed <= 0 or any(not math.isfinite(rate) or not 0 < rate <= max_feed + .001
+                                for rate in (feed, travel_feed)):
             raise ValueError("Некорректная скорость: она должна быть положительной и не выше максимума GRBL.")
         if action == "jog":
             delta = params["delta"]
@@ -1065,17 +1168,23 @@ class Controller:
             if action == "startpoint":
                 paths = [[paths[0][0]]]
             if self.pen.enabled:
-                self.draw_with_lift(paths, current, axes, feed, action)
+                self.draw_with_lift(paths, current, axes, feed, action, travel_feed)
                 self.emit("finished", action)
                 return
             moves = list(route(paths, current))
             distance = sum(math.dist(a, b) for a, b, _ in moves)
             timeout = max(15, distance / feed * 120 + 15)
             s.command("G21 G90 G94 G54")
-            for index, (_, point, _) in enumerate(moves):
-                x, y = axes.machine(point)
-                s.command(f"G1 X{x:.3f} Y{y:.3f} F{feed:.1f}", timeout=timeout)
-                self.emit("progress", (index + 1, len(moves)))
+            drawn = 0.0
+
+            def report(length):
+                nonlocal drawn
+                drawn += length
+                self.emit("progress", (drawn, distance))
+
+            commands = self.stroke_commands(current, (point for _, point, _ in moves), axes, feed,
+                                            live=action == "draw")
+            s.stream_moves(commands, report)
             actual = axes.paper(s.synchronize(timeout))
             if moves and math.dist(actual, moves[-1][1]) > .02:
                 raise RuntimeError("Контроллер не подтвердил конечную точку; задайте оба угла заново.")
@@ -1171,48 +1280,55 @@ class Controller:
             s.abort()
             raise
 
-    def draw_power_raises(self, paths, current, axes, feed, action):
+    def stroke_commands(self, start, points, axes, feed, *, live=False):
+        previous_feed = None
+        for point in points:
+            length = math.dist(start, point)
+            if length <= .0005:
+                continue
+            x, y = axes.machine(point)
+            requested = self.draw_feed_override if live else None
+            current_feed = feed if requested is None else requested
+            speed = f" F{current_feed:.3f}" if current_feed != previous_feed else ""
+            yield f"G1 X{x:.3f} Y{y:.3f}{speed}", length
+            previous_feed = current_feed
+            start = point
+
+    def draw_power_raises(self, paths, current, axes, feed, action, travel_feed):
         """Unpowered strokes, raised transfers; OFF after each full stop."""
         s = self.session
         total = sum(math.dist(a, b) for path in paths for a, b in zip(path, path[1:]))
         drawn = 0.
+
+        def report(length):
+            nonlocal drawn
+            drawn += length
+            self.emit("progress", (drawn, total))
+
         try:
             s.command("G21 G90 G94 G54")
-            s.set_pen(True, self.pen)
             for path in paths:
                 if math.dist(current, path[0]) > .0005:
-                    current = self.powered_travel(current, path[0], axes, feed)
+                    current = self.powered_travel(current, path[0], axes, travel_feed)
+                elif s.pen_down is not True or s.coil_on is not False:
+                    s.set_pen(True, self.pen)
                 if action == "startpoint":
                     break
-                # Lower and settle exactly at the stroke/dot position. No
-                # duty-cycle batching is needed while drawing unpowered.
-                s.set_pen(True, self.pen)
-                span = 0.
-                for point in path[1:]:
-                    length = math.dist(current, point)
-                    if length <= .0005:
-                        continue
-                    x, y = axes.machine(point)
-                    timeout = max(15, length / feed * 120 + 15)
-                    s.command(f"G1 X{x:.3f} Y{y:.3f} F{feed:.1f}", timeout=timeout)
-                    current = tuple(point)
-                    span += length
-                    drawn += length
-                    self.emit("progress", (drawn, total))
+                before = drawn
+                s.stream_moves(self.stroke_commands(current, path[1:], axes, feed, live=self.pen.continuous), report)
+                span = drawn - before
                 if span:
                     actual = axes.paper(s.synchronize(max(15, span / feed * 120 + 15)))
-                    if math.dist(actual, current) > .02:
+                    if math.dist(actual, path[-1]) > .02:
                         raise RuntimeError("Контроллер не подтвердил конец штриха; задайте оба угла заново.")
                     current = tuple(actual)
-            s.set_pen(True, self.pen)
-            s.synchronize(15)
         except Exception:
             s.abort()
             raise
 
-    def draw_with_lift(self, paths, current, axes, feed, action):
+    def draw_with_lift(self, paths, current, axes, feed, action, travel_feed):
         if self.pen.power_raises:
-            return self.draw_power_raises(paths, current, axes, feed, action)
+            return self.draw_power_raises(paths, current, axes, feed, action, travel_feed)
         s = self.session
         total = sum(math.dist(a,b) for path in paths for a,b in zip(path,path[1:]))
         drawn = 0.
@@ -1220,8 +1336,8 @@ class Controller:
             nonlocal current
             distance = math.dist(current, point)
             x,y = axes.machine(point)
-            timeout = max(15, distance / feed * 120 + 15)
-            s.command(f"G1 X{x:.3f} Y{y:.3f} F{feed:.1f}", timeout=timeout)
+            timeout = max(15, distance / travel_feed * 120 + 15)
+            s.command(f"G1 X{x:.3f} Y{y:.3f} F{travel_feed:.3f}", timeout=timeout)
             current = point
             return timeout
         try:
@@ -1243,10 +1359,16 @@ class Controller:
                 for batch in stroke_batches:
                     s.set_pen(True,self.pen)
                     span = 0.
-                    for point in batch:
-                        span += math.dist(current,point)
-                        move(point)
-                    s.synchronize(max(15,span/feed*120+15))
+
+                    def report(length):
+                        nonlocal span
+                        span += length
+
+                    s.stream_moves(self.stroke_commands(current, batch, axes, feed, live=self.pen.continuous), report)
+                    current = batch[-1]
+                    actual = axes.paper(s.synchronize(max(15, span / feed * 120 + 15)))
+                    if math.dist(actual, current) > .02:
+                        raise RuntimeError("Контроллер не подтвердил конец штриха; задайте оба угла заново.")
                     s.set_pen(False,self.pen)
                     drawn += span
                     self.emit("progress", (drawn,total))

@@ -46,6 +46,13 @@ int32_t dx = 0, dy = 0;
 float jogFeed = 0;
 uint8_t jogKey = 0;
 
+bool leaseFresh() {
+    // Capture the heartbeat first. The network task may renew between reads.
+    // Sampling millis() first could make the unsigned age wrap on renewal.
+    const uint32_t received = lastHeartbeat.load();
+    return uint32_t(millis() - received) <= leaseMs;
+}
+
 bool idle() {
     return state_is(::State::Idle) && !sys.abort() && !Job::active() && !plan_get_current_block();
 }
@@ -178,7 +185,7 @@ uint8_t beginJog(uint8_t key, uint32_t now, uint32_t generation) {
     if (!contains(int64_t(state.x) + dx, int64_t(state.y) + dy)) return bounds;
     const auto axis = Axes::_axis[dx ? X_AXIS : Y_AXIS];
     if (distance > double(axis->_maxTravel) * 1000) return bounds;
-    jogFeed = std::min(axis->_maxRate, 300.0f) * state.speed / 100.0f;
+    jogFeed = axis->_maxRate * state.speed / 100.0f;
     const double travelMs = 60.0 * distance / jogFeed;
     if (!std::isfinite(travelMs) || travelMs > 2'100'000) return invalid;
     jogBudget = uint32_t(travelMs) + 15000;
@@ -241,7 +248,7 @@ void perform(Request request, uint32_t now) {
                              request.panelGeneration != panelGeneration.load())) return;
     if (request.action == Action::Claim) {
         const bool acquired = request.session && !state.owner && stopped() && jogPhase == JogPhase::None &&
-                              uint32_t(now - lastHeartbeat.load()) <= leaseMs;
+                              leaseFresh();
         if (acquired) state.owner = request.session;
         note(0, 0, acquired ? ok : blocked, Decision::Claim, request.session);
         return;
@@ -361,7 +368,7 @@ bool takeRealtimeStop() {
     if (!enabled.load()) return false;
     const bool requested = resetRequested.exchange(false);
     const bool lost = state.owner && (state.owner != liveSession.load() ||
-                                      uint32_t(millis() - lastHeartbeat.load()) > leaseMs);
+                                      !leaseFresh());
     const auto jogGeneration = jogPanelGeneration.load();
     const bool lostPanel = jogGeneration && jogGeneration != panelGeneration.load();
     if (!requested && !lost && !lostPanel) return false;
@@ -414,7 +421,7 @@ bool allowsExternalLine(const char* line, uint32_t peer) {
         if (!std::strcmp(line, readOnly)) return true;
     }
     return peer && peer == livePeer.load() && state.owner && state.owner == liveSession.load() &&
-           uint32_t(millis() - lastHeartbeat.load()) <= leaseMs && !stopRequested.load() &&
+           leaseFresh() && !stopRequested.load() &&
            !resetRequested.load();
 }
 }
