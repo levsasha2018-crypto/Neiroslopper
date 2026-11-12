@@ -129,6 +129,17 @@ class DeviceUITests(unittest.TestCase):
             self.assertTrue(self.app.go_start())
             self.assertEqual(submit.call_args.kwargs['feed'], 3000)
 
+    def test_jog_at_100_percent_uses_the_selected_axis_limit(self):
+        self.prepare()
+        self.app.settings.update({110: 1800, 111: 900})
+        self.app.swap.set(False)
+        self.app.feed.set("100")
+        with patch.object(self.app, "submit") as submit:
+            self.app.jog(1, 0)
+            self.assertEqual(submit.call_args.kwargs["feed"], 1800)
+            self.app.jog(0, 1)
+            self.assertEqual(submit.call_args.kwargs["feed"], 900)
+
     def test_stop_blocks_job_until_calibrated_again(self):
         self.prepare()
         self.app.load_test()

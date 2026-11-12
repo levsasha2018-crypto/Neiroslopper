@@ -8,7 +8,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "PROGRAM"))
-from controller import GrblSession
+from controller import GrblSession, axis_feed_limit
 from machine_profiles import DLC32, fluidnc_configuration, fluidnc_pen_profile, pen_matches, settings_ready
 from pen_lift import PenLiftSettings
 
@@ -74,6 +74,48 @@ class V22Tests(unittest.TestCase):
             call("$/axes/y/acceleration_mm_per_sec2=40.000"),
         ])
         self.assertEqual(min(session.settings[110], session.settings[111]), 1500)
+
+    def test_speed_above_i2s_pulse_capacity_is_rejected_before_writes(self):
+        session = GrblSession(Mock(), threading.Event(), Mock(), DLC32)
+        session.settings = fluidnc_configuration(self.real_dump.splitlines())
+        self.assertEqual(session.settings["_xy_pulse_feed_max"], 93750)
+        with patch.object(session, "ready"), patch.object(session, "command") as command:
+            with self.assertRaisesRegex(ValueError, "частоте STEP"):
+                session.set_motion_limits(100000, 40, persist=True)
+        command.assert_not_called()
+
+    def test_speed_uses_the_direction_instead_of_the_slower_axis(self):
+        rates = {110: 1800, 111: 900}
+        self.assertEqual(axis_feed_limit(rates, (15, 0)), 1800)
+        self.assertEqual(axis_feed_limit(rates, (0, -15)), 900)
+        self.assertAlmostEqual(axis_feed_limit(rates, (20, -10)), (20**2 + 10**2)**.5 * 90)
+
+    def test_saving_speed_checks_inactive_file_before_switching(self):
+        session = GrblSession(Mock(port="tcp://localhost:23"), threading.Event(), Mock(), DLC32)
+        lines = self.real_dump.splitlines()
+        session.check_network_interlock = Mock()
+        session._network_config_dump = Mock(side_effect=[lines, lines])
+        session.command = Mock(side_effect=[["$Config/Filename=jd-motion-a.yaml"], [], [],
+                                            ["$Config/Filename=jd-motion-b.yaml"]])
+        session.save_motion_config()
+        self.assertEqual(session.command.call_args_list, [
+            call("$Config/Filename"), call("$Config/Dump=jd-motion-b.yaml", timeout=12),
+            call("$Config/Filename=jd-motion-b.yaml"), call("$Config/Filename"),
+        ])
+        self.assertEqual(session._network_config_dump.call_args_list, [call(None), call("jd-motion-b.yaml")])
+
+    def test_saving_speed_keeps_active_file_on_readback_mismatch(self):
+        session = GrblSession(Mock(port="tcp://localhost:23"), threading.Event(), Mock(), DLC32)
+        session.check_network_interlock = Mock()
+        changed = copy.deepcopy(self.config)
+        changed["axes"]["X"]["max_rate_mm_per_min"] = 900
+        session._network_config_dump = Mock(side_effect=[self.real_dump.splitlines(),
+                                                       yaml.safe_dump(changed).splitlines()])
+        session.command = Mock(side_effect=[["$Config/Filename=config.yaml"], []])
+        with self.assertRaisesRegex(ValueError, "не совпал"):
+            session.save_motion_config()
+        self.assertEqual(session.command.call_args_list,
+                         [call("$Config/Filename"), call("$Config/Dump=jd-motion-a.yaml", timeout=12)])
 
     def test_case_conflicting_axis_names_are_rejected(self):
         config = copy.deepcopy(self.config)

@@ -32,6 +32,16 @@ ALARM_REASONS = {
 }
 
 
+def axis_feed_limit(settings, delta=None):
+    rates = float(settings.get(110, 0)), float(settings.get(111, 0))
+    if not all(math.isfinite(rate) and rate > 0 for rate in rates):
+        return 0.
+    if delta is None or not any(delta):
+        return min(rates)
+    length = math.hypot(*delta)
+    return min(rate * length / abs(component) for rate, component in zip(rates, delta) if component)
+
+
 def dgus_marker(lines):
     markers = []
     for line in lines:
@@ -443,10 +453,11 @@ class GrblSession:
             self.settings = fluidnc_configuration(config_lines, self.settings)
         self.callback("settings", self.settings.copy())
 
-    def _network_config_dump(self):
-        """Read-only runtime YAML from the already connected motion peer."""
+    def _network_config_dump(self, filename=None):
+        """Read YAML from the already connected motion peer."""
         import ipaddress
         import urllib.request
+        from urllib.parse import urlencode
         from network_transport import _lan_address
 
         if self.cancelled.is_set():
@@ -464,7 +475,8 @@ class GrblSession:
                 raise OSError("MKS перенаправила запрос конфигурации на другой адрес.")
 
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        request = urllib.request.Request("http://" + host + "/command?plain=%24Config%2FDump", method="GET")
+        command = "$Config/Dump" if filename is None else "$LocalFS/Show=" + filename
+        request = urllib.request.Request("http://" + host + "/command?" + urlencode({"plain": command}), method="GET")
         with opener.open(request, timeout=12) as response:
             if response.status != 200:
                 raise OSError("MKS не вернула конфигурацию: HTTP " + str(response.status))
@@ -557,7 +569,7 @@ class GrblSession:
         self.refresh_settings()
         self.ready()
 
-    def set_motion_limits(self, rate, acceleration):
+    def set_motion_limits(self, rate, acceleration, *, persist=False):
         if self.machine_profile != DLC32:
             raise ValueError("Эта настройка доступна для MKS с FluidNC.")
         values = ((rate, 250000), (acceleration, 100000))
@@ -565,6 +577,9 @@ class GrblSession:
                not .001 <= value <= maximum for value, maximum in values):
             raise ValueError("Укажите положительные пределы подачи и ускорения MKS.")
         self.ready()
+        pulse_limit = self.settings.get("_xy_pulse_feed_max")
+        if pulse_limit is not None and rate > pulse_limit:
+            raise ValueError(f"При текущих шагах/мм MKS может выдать до {pulse_limit:g} мм/мин по частоте STEP.")
         changes = (
             (110, "x/max_rate_mm_per_min", rate),
             (111, "y/max_rate_mm_per_min", rate),
@@ -578,7 +593,47 @@ class GrblSession:
         self.refresh_settings()
         if any(not math.isclose(self.settings[key], value, abs_tol=.0005) for key, _, value in changes):
             raise RuntimeError("MKS не подтвердила новые пределы. Проверьте настройки после переподключения.")
-        self.callback("log", f"MKS до перезапуска: предел X/Y {rate:g} мм/мин, ускорение {acceleration:g} мм/с².")
+        if persist:
+            self.save_motion_config()
+        scope = "сохранено на MKS" if persist else "до перезапуска MKS"
+        self.callback("log", f"Скорость {scope}. X/Y: {rate:g} мм/мин, ускорение: {acceleration:g} мм/с².")
+
+    def config_filename(self):
+        prefix = "$Config/Filename="
+        names = [line[len(prefix):] for line in self.command("$Config/Filename")
+                 if line.startswith(prefix)]
+        if len(names) != 1 or not names[0]:
+            raise ValueError("MKS не сообщила имя текущей конфигурации.")
+        return names[0]
+
+    def save_motion_config(self):
+        import yaml
+
+        def read_config(filename=None):
+            if str(getattr(self.wire, "port", "")).lower().startswith("tcp:"):
+                return self._network_config_dump(filename)
+            command = "$Config/Dump" if filename is None else "$LocalFS/Show=" + filename
+            return self.command(command, timeout=12)
+
+        self.check_network_interlock()
+        previous = self.config_filename()
+        # Write and read back an inactive slot before switching the startup
+        # file. The old configuration survives a short write or link failure.
+        first, second = "jd-motion-a.yaml", "jd-motion-b.yaml"
+        target = second if previous.casefold().rsplit("/", 1)[-1] == first else first
+        runtime = read_config()
+        fluidnc_configuration(runtime)
+        self.check_network_interlock()
+        self.command("$Config/Dump=" + target, timeout=12)
+        saved = read_config(target)
+        fluidnc_configuration(saved)
+        if yaml.safe_load("\n".join(saved)) != yaml.safe_load("\n".join(runtime)):
+            raise ValueError("Файл MKS не совпал с настройками в памяти. Загрузочный профиль не переключён.")
+        self.check_network_interlock()
+        self.command("$Config/Filename=" + target)
+        if self.config_filename() != target:
+            raise RuntimeError("MKS не подтвердила новый загрузочный профиль.")
+        self.callback("log", f"Загрузочный профиль MKS: {target}. Предыдущий файл: {previous}.")
 
     def unlock_alarm(self):
         """Explicit MKS-only recovery; never moves, powers the relay, or homes.
@@ -1013,7 +1068,7 @@ class Controller:
             s.unlock_alarm()
             return
         if action == "motion_limits":
-            s.set_motion_limits(params["rate"], params["acceleration"])
+            s.set_motion_limits(params["rate"], params["acceleration"], persist=params.get("persist", False))
             return
         if action == "configure":
             self.zero = False
@@ -1102,16 +1157,15 @@ class Controller:
             return
         feed = float(params.get("feed", MACHINE_MAX_FEED / 2))
         travel_feed = float(params.get("travel_feed", feed))
-        max_feed = min(float(s.settings.get(110, 0)), float(s.settings.get(111, 0)))
-        if max_feed <= 0 or any(not math.isfinite(rate) or not 0 < rate <= max_feed + .001
-                                for rate in (feed, travel_feed)):
-            raise ValueError("Некорректная скорость: она должна быть положительной и не выше максимума GRBL.")
+        max_feed = axis_feed_limit(s.settings)
         if action == "jog":
             delta = params["delta"]
             distance = math.hypot(*delta)
             if not all(math.isfinite(v) for v in delta) or not 0.01 <= distance <= MAX_JOG_DISTANCE + 0.001:
                 raise ValueError(f"Ход за нажатие должен быть от 0,01 до {MAX_JOG_DISTANCE:g} мм.")
             dx, dy = axes.machine(delta)
+            if not math.isfinite(feed) or not 0 < feed <= axis_feed_limit(s.settings, (dx, dy)) + .001:
+                raise ValueError("Скорость перемещения выше предела в выбранном направлении.")
             target = axes.paper((position[0] + dx, position[1] + dy))
             if self.sheet and not self.sheet.contains(target):
                 raise ValueError("Этот шаг выходит за границы заданного листа.")
@@ -1123,6 +1177,9 @@ class Controller:
             s.command(f"$J=G91 G21 X{dx:.3f} Y{dy:.3f} F{feed:.1f}")
             s.wait_jog(timeout=max(30, distance / feed * 120 + 15))
             return
+        if max_feed <= 0 or any(not math.isfinite(rate) or not 0 < rate <= max_feed + .001
+                                for rate in (feed, travel_feed)):
+            raise ValueError("Некорректная скорость: она должна быть положительной и не выше максимума GRBL.")
         if action == "scan":
             if not self.zero or not self.sheet:
                 raise ValueError("Для сканирования сначала задайте проверенную область двумя углами.")
@@ -1167,8 +1224,16 @@ class Controller:
                 raise ValueError("Текущее положение вне листа. Повторите установку двух углов.")
             if action == "startpoint":
                 paths = [[paths[0][0]]]
+            directional = self.machine_profile == DLC32 and params.get("axis_speed") is True
+
+            def for_move(rate, start, end):
+                if not directional:
+                    return rate
+                dx, dy = axes.machine((end[0] - start[0], end[1] - start[1]))
+                return rate * axis_feed_limit(s.settings, (dx, dy)) / max_feed
+
             if self.pen.enabled:
-                self.draw_with_lift(paths, current, axes, feed, action, travel_feed)
+                self.draw_with_lift(paths, current, axes, feed, action, travel_feed, for_move)
                 self.emit("finished", action)
                 return
             moves = list(route(paths, current))
@@ -1183,7 +1248,7 @@ class Controller:
                 self.emit("progress", (drawn, distance))
 
             commands = self.stroke_commands(current, (point for _, point, _ in moves), axes, feed,
-                                            live=action == "draw")
+                                            for_move, live=action == "draw")
             s.stream_moves(commands, report)
             actual = axes.paper(s.synchronize(timeout))
             if moves and math.dist(actual, moves[-1][1]) > .02:
@@ -1280,7 +1345,7 @@ class Controller:
             s.abort()
             raise
 
-    def stroke_commands(self, start, points, axes, feed, *, live=False):
+    def stroke_commands(self, start, points, axes, feed, for_move, *, live=False):
         previous_feed = None
         for point in points:
             length = math.dist(start, point)
@@ -1288,13 +1353,13 @@ class Controller:
                 continue
             x, y = axes.machine(point)
             requested = self.draw_feed_override if live else None
-            current_feed = feed if requested is None else requested
+            current_feed = round(for_move(feed if requested is None else requested, start, point), 3)
             speed = f" F{current_feed:.3f}" if current_feed != previous_feed else ""
             yield f"G1 X{x:.3f} Y{y:.3f}{speed}", length
             previous_feed = current_feed
             start = point
 
-    def draw_power_raises(self, paths, current, axes, feed, action, travel_feed):
+    def draw_power_raises(self, paths, current, axes, feed, action, travel_feed, for_move):
         """Unpowered strokes, raised transfers; OFF after each full stop."""
         s = self.session
         total = sum(math.dist(a, b) for path in paths for a, b in zip(path, path[1:]))
@@ -1309,13 +1374,14 @@ class Controller:
             s.command("G21 G90 G94 G54")
             for path in paths:
                 if math.dist(current, path[0]) > .0005:
-                    current = self.powered_travel(current, path[0], axes, travel_feed)
+                    rate = for_move(travel_feed, current, path[0])
+                    current = self.powered_travel(current, path[0], axes, rate)
                 elif s.pen_down is not True or s.coil_on is not False:
                     s.set_pen(True, self.pen)
                 if action == "startpoint":
                     break
                 before = drawn
-                s.stream_moves(self.stroke_commands(current, path[1:], axes, feed, live=self.pen.continuous), report)
+                s.stream_moves(self.stroke_commands(current, path[1:], axes, feed, for_move, live=self.pen.continuous), report)
                 span = drawn - before
                 if span:
                     actual = axes.paper(s.synchronize(max(15, span / feed * 120 + 15)))
@@ -1326,9 +1392,9 @@ class Controller:
             s.abort()
             raise
 
-    def draw_with_lift(self, paths, current, axes, feed, action, travel_feed):
+    def draw_with_lift(self, paths, current, axes, feed, action, travel_feed, for_move):
         if self.pen.power_raises:
-            return self.draw_power_raises(paths, current, axes, feed, action, travel_feed)
+            return self.draw_power_raises(paths, current, axes, feed, action, travel_feed, for_move)
         s = self.session
         total = sum(math.dist(a,b) for path in paths for a,b in zip(path,path[1:]))
         drawn = 0.
@@ -1336,8 +1402,9 @@ class Controller:
             nonlocal current
             distance = math.dist(current, point)
             x,y = axes.machine(point)
-            timeout = max(15, distance / travel_feed * 120 + 15)
-            s.command(f"G1 X{x:.3f} Y{y:.3f} F{travel_feed:.3f}", timeout=timeout)
+            rate = for_move(travel_feed, current, point)
+            timeout = max(15, distance / rate * 120 + 15)
+            s.command(f"G1 X{x:.3f} Y{y:.3f} F{rate:.3f}", timeout=timeout)
             current = point
             return timeout
         try:
@@ -1364,7 +1431,7 @@ class Controller:
                         nonlocal span
                         span += length
 
-                    s.stream_moves(self.stroke_commands(current, batch, axes, feed, live=self.pen.continuous), report)
+                    s.stream_moves(self.stroke_commands(current, batch, axes, feed, for_move, live=self.pen.continuous), report)
                     current = batch[-1]
                     actual = axes.paper(s.synchronize(max(15, span / feed * 120 + 15)))
                     if math.dist(actual, current) > .02:

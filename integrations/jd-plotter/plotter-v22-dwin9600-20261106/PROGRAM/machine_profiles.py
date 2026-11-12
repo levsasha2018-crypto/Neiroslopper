@@ -309,7 +309,16 @@ def fluidnc_v22_configuration(config, legacy=None):
             config.get("start", {}).get("check_limits", False) is False, "не совпадает режим ручной калибровки")
     require(all(value in (None, "") for key, value in (config.get("macros") or {}).items()
                 if key.startswith(("startup", "after_"))), "есть автоматические макросы")
+    pulse = config["stepping"].get("pulse_us", 4)
+    frame = i2s.get("min_pulse_us", 2)
+    require(type(pulse) is int and 0 <= pulse <= 30 and type(frame) is int and frame in (1, 2, 4),
+            "неверная длительность импульсов I2S")
+    # Match the ESP32 I2S engine's rounding to whole frames and its
+    # minimum OFF time. This bounds the pulse generator, not motor torque.
+    pulse_frames = math.ceil(min(max(pulse, frame), 20) / frame)
+    step_hz = 1_000_000 // (2 * pulse_frames * frame)
     result.update({PROFILE_KEY: DLC32, "_board_revision": "2.2", "_axis_layout": "x_carriage_y_portal",
+                   "_xy_pulse_feed_max": step_hz * 60 / max(result[100], result[101]),
                    "_dwin_uart_baud": 9600,
                    13: 0, 20: 0, 21: 0, 22: 0, 1: config.get("stepping", {}).get("idle_ms", 100)})
     return result

@@ -6,7 +6,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from controller import Controller, REQUIRED, MACHINE_MAX_FEED, MAX_JOG_DISTANCE
+from controller import Controller, REQUIRED, MAX_JOG_DISTANCE, axis_feed_limit
 from eventlog import EventLog, record_event
 from geometry import Axes, load_svg, test_square
 from editor_history import EditHistory
@@ -249,6 +249,10 @@ class App:
                                                command=self.apply_motion_limits)
         self.motion_limits_button.pack(fill="x", pady=3)
         self.motion_limits_fields.append(self.motion_limits_button)
+        save_limits = ttk.Button(limits, text="Сохранить на MKS",
+                                 command=lambda: self.apply_motion_limits(persist=True))
+        save_limits.pack(fill="x", pady=(0, 3))
+        self.motion_limits_fields.append(save_limits)
         ttk.Label(limits, textvariable=self.motion_maximum, wraplength=305).pack(anchor="w")
         self.motion_limits_box = limits
         self.axis_widgets = []
@@ -956,14 +960,14 @@ class App:
         self.preserve_draft()
         self.submit("unlock", confirmed=True)
 
-    def apply_motion_limits(self):
+    def apply_motion_limits(self, *, persist=False):
         try:
             rate = float(self.motion_rate.get().replace(",", "."))
             acceleration = float(self.motion_acceleration.get().replace(",", "."))
         except ValueError:
             self.note("Для пределов MKS укажите числа в мм/мин и мм/с².")
             return
-        self.submit("motion_limits", rate=rate, acceleration=acceleration)
+        self.submit("motion_limits", rate=rate, acceleration=acceleration, persist=persist)
 
     def apply_drawing_feed(self, event=None):
         if self.controller.drawing:
@@ -973,15 +977,15 @@ class App:
                 self.note("Скорость рисования: введите число от 1 до 100%.")
             else:
                 if self.controller.change_drawing_feed(feed):
-                    self.note(f"Новая скорость рисования {feed:g} мм/мин применяется к следующим участкам.")
+                    self.note("Новая скорость рисования применяется к следующим участкам.")
 
-    def get_feed(self, *, drawing=False):
+    def get_feed(self, *, drawing=False, delta=None):
         field = self.draw_feed if drawing else self.feed
         percent = float(field.get().replace(",", "."))
         if not math.isfinite(percent) or not 1 <= percent <= 100:
             raise ValueError("Введите скорость от 1 до 100%.")
-        configured_max = min(float(self.settings.get(110, MACHINE_MAX_FEED)),
-                             float(self.settings.get(111, MACHINE_MAX_FEED)))
+        direction = self.axes().machine(delta) if delta is not None else None
+        configured_max = axis_feed_limit(self.settings or REQUIRED, direction)
         return configured_max * percent / 100.0
 
     def get_step(self):
@@ -993,7 +997,7 @@ class App:
     def jog(self, dx, dy):
         try:
             step = self.get_step()
-            self.submit("jog", delta=(dx * step, dy * step), feed=self.get_feed())
+            self.submit("jog", delta=(dx * step, dy * step), feed=self.get_feed(delta=(dx, dy)))
         except ValueError as exc:
             messagebox.showerror("Проверьте ввод", str(exc), parent=self.root)
 
@@ -1133,7 +1137,7 @@ class App:
             travel = self.get_feed()
             feed = self.get_feed(drawing=True) if action == "draw" else travel
             accepted = self.submit(action, paths=[list(path) for path in self.paths],
-                                   feed=feed, travel_feed=travel,
+                                   feed=feed, travel_feed=travel, axis_speed=True,
                                    panel_request=panel_request, panel_context=panel_context)
             if accepted:
                 self.progress["value"] = 0
@@ -1203,7 +1207,7 @@ class App:
         for widget in self.motion_limits_fields:
             widget.configure(state="normal" if ready and mks else "disabled")
         rates = [self.settings.get(key) for key in (110, 111)]
-        self.motion_maximum.set(f"100% сейчас = {min(rates):g} мм/мин" if all(rates) else
+        self.motion_maximum.set(f"100%: X {rates[0]:g}, Y {rates[1]:g} мм/мин" if all(rates) else
                                 "Предел платы появится после подключения.")
         self.connect_button.configure(text="Отключить" if self.connected else "Подключить")
         for widget, enabled in (
@@ -1386,7 +1390,7 @@ class App:
                 if 1 in value:
                     self.hold.set(value[1] == 255)
                 self.note("Шаги/мм: X=" + str(value.get(100, "?")) + "; Y=" + str(value.get(101, "?"))
-                          + "; 100% скорости=" + str(min(value.get(110, 0), value.get(111, 0))) + " мм/мин")
+                          + f" · 100% скорости X={value.get(110, 0):g}, Y={value.get(111, 0):g} мм/мин")
             elif name == "pen_firmware":
                 self.pen_firmware = value
                 if self.settings.get("_board_revision") == "2.2" and value:
